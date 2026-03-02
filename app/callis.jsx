@@ -13,20 +13,30 @@ function generateId() {
   return id;
 }
 
-async function saveRoadmap(roadmapData, answersData, goalText) {
+async function saveRoadmap(roadmapData, answersData, goalText, retries = 2) {
   const id = generateId();
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/roadmaps`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify({ id, goal: goalText, roadmap: roadmapData, answers: answersData }),
-  });
-  if (!res.ok) throw new Error("Failed to save");
-  return id;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/roadmaps`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify({ id, goal: goalText, roadmap: roadmapData, answers: answersData, progress: {} }),
+      });
+      if (!res.ok) {
+        const err = await res.text().catch(() => "");
+        throw new Error(`Save failed (${res.status}): ${err}`);
+      }
+      return id;
+    } catch (e) {
+      if (attempt === retries) throw e;
+      await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+    }
+  }
 }
 
 async function loadRoadmap(id) {
@@ -37,6 +47,20 @@ async function loadRoadmap(id) {
   const data = await res.json();
   if (!data.length) throw new Error("Roadmap not found");
   return data[0];
+}
+
+async function updateProgress(id, progress) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/roadmaps?id=eq.${id}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+      },
+      body: JSON.stringify({ progress }),
+    });
+  } catch (e) { /* silent fail for progress saves */ }
 }
 
 /* ─── SOUND SYSTEM — Minecraft-style ambient ─── */
@@ -399,6 +423,9 @@ const Icon = {
   ),
   science: (sz = 16, c = "currentColor") => (
     <svg width={sz} height={sz} viewBox="0 0 16 16" fill="none"><path d="M6 2v4.5L2.5 13a1 1 0 00.9 1.5h9.2a1 1 0 00.9-1.5L10 6.5V2" stroke={c} strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/><path d="M5 2h6" stroke={c} strokeWidth="1.2" strokeLinecap="round"/><circle cx="7" cy="11" r="0.8" fill={c}/><circle cx="9.5" cy="12" r="0.6" fill={c}/></svg>
+  ),
+  bookmark: (sz = 12, c = "currentColor") => (
+    <svg width={sz} height={sz} viewBox="0 0 16 16" fill="none"><path d="M3 2.5A1.5 1.5 0 014.5 1h7A1.5 1.5 0 0113 2.5v12L8 11l-5 3.5V2.5z" stroke={c} strokeWidth="1.3" strokeLinejoin="round"/></svg>
   ),
 };
 
@@ -1203,6 +1230,7 @@ export default function PasoLive() {
   const [shareId, setShareId] = useState(null);
   const [shareStatus, setShareStatus] = useState(""); // "", "saving", "copied", "error"
   const [isSharedView, setIsSharedView] = useState(false);
+  const [showInstallTip, setShowInstallTip] = useState(false);
   const phaseRefs = useRef([]);
 
   // Check URL for shared roadmap on mount
@@ -1218,6 +1246,9 @@ export default function PasoLive() {
         setShareId(id);
         setIsSharedView(true);
         setUnlocked(true);
+        if (data.progress && typeof data.progress === "object") {
+          setCheckedMilestones(data.progress);
+        }
         setStep("roadmap");
       }).catch(() => {
         setError("This roadmap link is invalid or has expired.");
@@ -1338,8 +1369,10 @@ export default function PasoLive() {
 
   const handleShare = async () => {
     if (shareId) {
+      // Already saved — update progress then copy link
+      updateProgress(shareId, checkedMilestones);
       const link = `${window.location.origin}${window.location.pathname}#/r/${shareId}`;
-      await navigator.clipboard.writeText(link);
+      try { await navigator.clipboard.writeText(link); } catch { /* fallback below */ }
       setShareStatus("copied");
       setTimeout(() => setShareStatus(""), 2500);
       return;
@@ -1350,12 +1383,13 @@ export default function PasoLive() {
       setShareId(id);
       const link = `${window.location.origin}${window.location.pathname}#/r/${id}`;
       window.location.hash = `/r/${id}`;
-      await navigator.clipboard.writeText(link);
+      try { await navigator.clipboard.writeText(link); } catch { /* clipboard may fail on mobile */ }
       setShareStatus("copied");
       setTimeout(() => setShareStatus(""), 2500);
     } catch (e) {
+      console.error("Share error:", e);
       setShareStatus("error");
-      setTimeout(() => setShareStatus(""), 2500);
+      setTimeout(() => setShareStatus(""), 3000);
     }
   };
 
@@ -1382,6 +1416,17 @@ export default function PasoLive() {
       return { ...p, [key]: !wasChecked };
     });
   }, [soundEnabled]);
+
+  // Debounced save progress to Supabase when milestones change
+  const progressSaveRef = useRef(null);
+  useEffect(() => {
+    if (!shareId || Object.keys(checkedMilestones).length === 0) return;
+    clearTimeout(progressSaveRef.current);
+    progressSaveRef.current = setTimeout(() => {
+      updateProgress(shareId, checkedMilestones);
+    }, 1500);
+    return () => clearTimeout(progressSaveRef.current);
+  }, [checkedMilestones, shareId]);
 
   const totalMilestones = roadmap ? roadmap.phases.reduce((s, p) => s + p.milestones.length, 0) : 0;
   const checkedCount = Object.values(checkedMilestones).filter(Boolean).length;
@@ -1787,12 +1832,32 @@ export default function PasoLive() {
           <>
             {/* Shared view banner */}
             {isSharedView && (
-              <div style={{ animation: "fadeIn 0.5s ease both", marginTop: 12, marginBottom: -20, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 16px", borderRadius: 12, background: "rgba(108,92,231,0.04)", border: "1px solid rgba(108,92,231,0.1)" }}>
-                <span style={{ ...B, fontSize: 12, color: INK30 }}>You're viewing a shared roadmap</span>
-                <button onClick={() => { setIsSharedView(false); handleReset(); }}
-                  style={{ ...M, fontSize: 10, letterSpacing: "0.04em", padding: "6px 14px", borderRadius: 8, border: "none", background: ACCENT, color: "#fff", cursor: "pointer" }}>
-                  Make your own
-                </button>
+              <div style={{ animation: "fadeIn 0.5s ease both", marginTop: 12, marginBottom: -20 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 16px", borderRadius: 12, background: "rgba(108,92,231,0.04)", border: "1px solid rgba(108,92,231,0.1)", flexWrap: "wrap", gap: 8 }}>
+                  <span style={{ ...B, fontSize: 12, color: INK30 }}>You're viewing a shared roadmap · progress saves automatically</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => setShowInstallTip(true)}
+                      style={{ ...M, fontSize: 10, letterSpacing: "0.04em", padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(108,92,231,0.15)", background: "rgba(255,255,255,0.5)", color: ACCENT, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}>
+                      {Icon.bookmark(12, ACCENT)} Save to homescreen
+                    </button>
+                    <button onClick={() => { setIsSharedView(false); handleReset(); }}
+                      style={{ ...M, fontSize: 10, letterSpacing: "0.04em", padding: "6px 14px", borderRadius: 8, border: "none", background: ACCENT, color: "#fff", cursor: "pointer" }}>
+                      Make your own
+                    </button>
+                  </div>
+                </div>
+                {showInstallTip && (
+                  <div style={{ animation: "slideUp 0.3s ease both", marginTop: 8, padding: "16px 20px", borderRadius: 14, background: "rgba(255,255,255,0.7)", backdropFilter: "blur(20px)", border: "1px solid rgba(255,255,255,0.6)", position: "relative" }}>
+                    <button onClick={() => setShowInstallTip(false)} style={{ position: "absolute", top: 10, right: 14, background: "none", border: "none", cursor: "pointer", ...M, fontSize: 12, color: INK25 }}>✕</button>
+                    <div style={{ ...M, fontSize: 9, letterSpacing: "0.12em", textTransform: "uppercase", color: ACCENT, marginBottom: 10 }}>Save for easy access</div>
+                    <div style={{ ...B, fontSize: 13, color: INK45, lineHeight: 1.7 }}>
+                      <strong style={{ color: INK60 }}>iPhone/iPad:</strong> Tap the share button (□↑) in Safari → "Add to Home Screen"<br/>
+                      <strong style={{ color: INK60 }}>Android:</strong> Tap ⋮ menu in Chrome → "Add to Home Screen"<br/>
+                      <strong style={{ color: INK60 }}>Desktop:</strong> Bookmark this page (⌘/Ctrl + D)
+                    </div>
+                    <div style={{ ...B, fontSize: 11, color: INK25, marginTop: 8 }}>Your progress is saved to the link — come back anytime and pick up where you left off.</div>
+                  </div>
+                )}
               </div>
             )}
 
